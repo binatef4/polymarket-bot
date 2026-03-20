@@ -3,8 +3,6 @@ import time
 import json
 import logging
 import requests
-import hashlib
-import hmac
 from datetime import datetime
 from anthropic import Anthropic
 
@@ -12,46 +10,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', hand
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
-POLY_API_KEY = os.environ.get('POLY_API_KEY', '')
+RELAYER_API_KEY = os.environ.get('RELAYER_API_KEY', '')
 POLY_PRIVATE_KEY = os.environ.get('POLY_PRIVATE_KEY', '')
-POLY_SECRET = os.environ.get('POLY_SECRET', '')
-POLY_PASSPHRASE = os.environ.get('POLY_PASSPHRASE', '')
 SCAN_INTERVAL = int(os.environ.get('SCAN_INTERVAL', 300))
 MAX_TRADE_AMOUNT = float(os.environ.get('MAX_TRADE_AMOUNT', 10))
 MIN_CONFIDENCE = float(os.environ.get('MIN_CONFIDENCE', 55))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+RELAYER_API = "https://relayer.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-def get_auth_headers():
-    """Build auth headers for CLOB API"""
-    timestamp = str(int(time.time()))
-    
-    if POLY_SECRET and POLY_PASSPHRASE:
-        # CLOB auth with secret
-        msg = timestamp + "GET" + "/auth/api-key"
-        signature = hmac.new(
-            POLY_SECRET.encode('utf-8'),
-            msg.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        return {
-            "POLY_ADDRESS": POLY_PRIVATE_KEY,
-            "POLY_SIGNATURE": signature,
-            "POLY_TIMESTAMP": timestamp,
-            "POLY_NONCE": "0",
-            "POLY_PASSPHRASE": POLY_PASSPHRASE,
-            "Content-Type": "application/json"
-        }
-    else:
-        # Simple auth with API key
-        return {
-            "POLY_ADDRESS": POLY_PRIVATE_KEY,
-            "POLY_SIGNATURE": POLY_API_KEY,
-            "Content-Type": "application/json"
-        }
 
 def get_markets():
     try:
@@ -70,13 +39,11 @@ def get_markets():
         return []
 
 def get_best_price(token_id):
-    """Get best price from multiple sources"""
     try:
         # Try orderbook
         r = requests.get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=10)
         if r.status_code == 200:
-            book = r.json()
-            asks = book.get('asks', [])
+            asks = r.json().get('asks', [])
             if asks:
                 best = min(asks, key=lambda x: float(x.get('price', 1)))
                 price = float(best.get('price', 0))
@@ -90,24 +57,60 @@ def get_best_price(token_id):
             if 0.01 <= price <= 0.99:
                 return price
 
-        # Try price endpoint
-        r3 = requests.get(f"{CLOB_API}/price", params={"token_id": token_id, "side": "buy"}, timeout=10)
-        if r3.status_code == 200:
-            price = float(r3.json().get('price', 0))
-            if 0.01 <= price <= 0.99:
-                return price
-
         return 0
     except Exception as e:
         logger.error(f"❌ Price error: {e}")
         return 0
 
-def execute_trade(token_id, amount, price):
-    """Execute trade using L1 auth (private key signing)"""
+def execute_trade_relayer(token_id, outcome, amount, price, condition_id):
+    """Execute trade using Relayer API"""
     try:
+        if not RELAYER_API_KEY or not POLY_PRIVATE_KEY:
+            logger.error("❌ Missing RELAYER_API_KEY or POLY_PRIVATE_KEY")
+            return False
+
+        headers = {
+            "Content-Type": "application/json",
+            "RELAYER_API_KEY": RELAYER_API_KEY,
+            "POLY_ADDRESS": POLY_PRIVATE_KEY,
+        }
+
         size = round(amount / price, 4)
-        nonce = str(int(time.time()))
-        
+
+        payload = {
+            "conditionId": condition_id,
+            "tokenId": token_id,
+            "side": "BUY",
+            "price": str(round(price, 4)),
+            "size": str(size),
+            "outcome": outcome,
+        }
+
+        logger.info(f"📤 Relayer order: {outcome} price={price} size={size}")
+        r = requests.post(f"{RELAYER_API}/order", headers=headers, json=payload, timeout=15)
+
+        if r.status_code == 200:
+            logger.info(f"✅ TRADE EXECUTED via Relayer! {r.json()}")
+            return True
+        else:
+            logger.error(f"❌ Relayer failed {r.status_code}: {r.text[:200]}")
+            # Fallback to CLOB
+            return execute_trade_clob(token_id, amount, price)
+
+    except Exception as e:
+        logger.error(f"❌ Relayer error: {e}")
+        return False
+
+def execute_trade_clob(token_id, amount, price):
+    """Fallback: Execute trade using CLOB API"""
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "POLY_ADDRESS": POLY_PRIVATE_KEY,
+            "POLY_SIGNATURE": RELAYER_API_KEY,
+        }
+
+        size = round(amount / price, 4)
         order = {
             "token_id": token_id,
             "price": str(round(price, 4)),
@@ -115,24 +118,22 @@ def execute_trade(token_id, amount, price):
             "side": "BUY",
             "type": "FOK",
             "fee_rate_bps": "0",
-            "nonce": nonce,
+            "nonce": str(int(time.time())),
             "expiration": "0"
         }
 
-        headers = get_auth_headers()
-        
-        logger.info(f"📤 Order: price={price} size={size} amount=${amount}")
+        logger.info(f"📤 CLOB order: price={price} size={size}")
         r = requests.post(f"{CLOB_API}/order", headers=headers, json=order, timeout=15)
-        
+
         if r.status_code == 200:
-            result = r.json()
-            logger.info(f"✅ TRADE EXECUTED! {result}")
+            logger.info(f"✅ TRADE EXECUTED via CLOB! {r.json()}")
             return True
         else:
-            logger.error(f"❌ Order failed {r.status_code}: {r.text[:200]}")
+            logger.error(f"❌ CLOB failed {r.status_code}: {r.text[:200]}")
             return False
+
     except Exception as e:
-        logger.error(f"❌ Execute error: {e}")
+        logger.error(f"❌ CLOB error: {e}")
         return False
 
 def analyze_market(market):
@@ -152,6 +153,8 @@ def analyze_market(market):
         if isinstance(prices, str):
             try: prices = json.loads(prices)
             except: prices = []
+
+        condition_id = market.get('conditionId', '')
 
         tokens = []
         for i, outcome in enumerate(outcomes):
@@ -187,6 +190,7 @@ Respond ONLY with JSON:
         if token_index is not None and token_index < len(tokens):
             result['token_id'] = tokens[token_index]['token_id']
             result['outcome'] = tokens[token_index]['outcome']
+            result['condition_id'] = condition_id
 
         return result
     except Exception as e:
@@ -196,7 +200,7 @@ Respond ONLY with JSON:
 def run_scan():
     logger.info("=" * 50)
     logger.info(f"🔍 Scan at {datetime.now().strftime('%H:%M:%S')}")
-    
+
     markets = get_markets()
     if not markets:
         return
@@ -209,16 +213,18 @@ def run_scan():
         decision = analysis.get('decision', 'HOLD')
         confidence = analysis.get('confidence', 0)
         token_id = analysis.get('token_id')
+        outcome = analysis.get('outcome', '')
+        condition_id = analysis.get('condition_id', '')
 
         if decision != 'HOLD' and confidence >= MIN_CONFIDENCE and token_id:
             price = get_best_price(token_id)
-            logger.info(f"💰 Price: {price} | Outcome: {analysis.get('outcome')}")
+            logger.info(f"💰 Price: {price} | Outcome: {outcome}")
 
             if price > 0:
                 logger.info(f"🚀 EXECUTING: {decision} at {price} for ${MAX_TRADE_AMOUNT}")
-                if execute_trade(token_id, MAX_TRADE_AMOUNT, price):
+                if execute_trade_relayer(token_id, outcome, MAX_TRADE_AMOUNT, price, condition_id):
                     executed += 1
-                    logger.info(f"🎉 TRADE #{executed} DONE!")
+                    logger.info(f"🎉 TRADE #{executed} SUCCESS!")
             else:
                 logger.warning(f"⚠️ No price for token")
         else:
@@ -229,14 +235,15 @@ def run_scan():
     logger.info(f"\n✅ Done! Executed {executed} | Next in {SCAN_INTERVAL//60}min")
 
 def main():
-    logger.info("🚀 Polymarket AI Bot v4 - FINAL!")
+    logger.info("🚀 Polymarket AI Bot v5 - RELAYER!")
     logger.info(f"⚙️ Max=${MAX_TRADE_AMOUNT} | MinConf={MIN_CONFIDENCE}% | Every {SCAN_INTERVAL//60}min")
-    
+
     if not ANTHROPIC_API_KEY:
         logger.error("❌ No ANTHROPIC_API_KEY!")
         return
 
-    logger.info(f"🔑 Auth: {'CLOB+Secret' if POLY_SECRET else 'API Key'}")
+    if not RELAYER_API_KEY:
+        logger.warning("⚠️ No RELAYER_API_KEY!")
 
     while True:
         try:
