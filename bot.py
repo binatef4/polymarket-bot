@@ -5,7 +5,8 @@ import logging
 import requests
 from datetime import datetime
 from anthropic import Anthropic
-
+from eth_account import Account
+from eth_account.messages import encode_defunct
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', handlers=[logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
@@ -285,10 +286,12 @@ def execute_trade(token_id, amount, price):
             return False
 
         size = round(amount / price, 4)
-        headers = {
-            "Content-Type": "application/json",
-            "POLY_ADDRESS": POLY_PRIVATE_KEY,
-            "POLY_SIGNATURE": POLY_API_KEY,
+account = Account.from_key(POLY_PRIVATE_KEY)
+
+headers = {
+    "Content-Type": "application/json",
+    "POLY_ADDRESS": account.address,
+}
         }
         order = {
             "token_id": token_id,
@@ -301,6 +304,11 @@ def execute_trade(token_id, amount, price):
             "expiration": "0"
         }
         logger.info(f"📤 Order: price={price} size={size} amount=${amount}")
+message = json.dumps(order, separators=(',', ':'))
+
+message_encoded = encode_defunct(text=message)
+signed = account.sign_message(message_encoded)
+headers["POLY_SIGNATURE"] = signed.signature.hex()
         r = requests.post(f"{CLOB_API}/order", headers=headers, json=order, timeout=15)
         if r.status_code == 200:
             logger.info(f"✅ TRADE EXECUTED! {r.json()}")
