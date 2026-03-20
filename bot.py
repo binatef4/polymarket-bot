@@ -292,7 +292,6 @@ headers = {
     "Content-Type": "application/json",
     "POLY_ADDRESS": account.address,
 }
-        }
         order = {
             "token_id": token_id,
             "price": str(round(price, 4)),
